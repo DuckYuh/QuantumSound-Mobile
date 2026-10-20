@@ -1,17 +1,13 @@
 import * as SecureStore from "expo-secure-store";
+import { TokenStorageError } from "./token-storage-error";
+
+export { TokenStorageError } from "./token-storage-error";
 
 const refreshTokenKey = "quantumsound.refresh-token";
 const options: SecureStore.SecureStoreOptions = {
   keychainService: "quantumsound.auth",
   keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
 };
-
-export class TokenStorageError extends Error {
-  constructor(public readonly operation: "read" | "write" | "delete") {
-    super(`Secure token storage failed to ${operation}.`);
-    this.name = "TokenStorageError";
-  }
-}
 
 async function securely<T>(
   operation: TokenStorageError["operation"],

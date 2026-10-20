@@ -2,6 +2,7 @@ import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-
 import { type PropsWithChildren, useEffect, useState } from "react";
 import { AppState, Platform } from "react-native";
 
+import { AuthError } from "@/features/auth/error";
 import { ApiError } from "@/api/error";
 
 export function QueryProvider({ children }: PropsWithChildren) {
@@ -11,6 +12,7 @@ export function QueryProvider({ children }: PropsWithChildren) {
         staleTime: 60_000,
         gcTime: 5 * 60_000,
         retry: (failureCount, error) => {
+          if (error instanceof AuthError) return false;
           if (error instanceof ApiError && error.status && error.status < 500) return false;
           return failureCount < 2;
         },

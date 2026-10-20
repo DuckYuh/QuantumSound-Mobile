@@ -45,7 +45,8 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --require ./tests/register-typescript.cjs --test tests/auth.test.cjs"
   },
   "private": true,
   "packageManager": "pnpm@11.10.0"

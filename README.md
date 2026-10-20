@@ -1,6 +1,6 @@
 # QuantumSound Mobile
 
-Expo/React Native foundation for QuantumSound, sharing the NestJS backend with the web and desktop applications. Routes deliberately render blank placeholders; application UI and business features are not implemented.
+Expo/React Native foundation for QuantumSound, sharing the NestJS backend with the web and desktop applications. Routes deliberately render blank placeholders; authentication infrastructure is implemented, while application UI remains intentionally unimplemented.
 
 The [setup report](docs/foundation-setup.md) contains the final file inventory, directory tree and validation results.
 
@@ -23,6 +23,7 @@ On PowerShell, use `Copy-Item .env.example .env.local` and `pnpm.cmd` if script 
 | `pnpm web` | Start the web preview |
 | `pnpm lint` | Expo ESLint configuration |
 | `pnpm typecheck` | Strict TypeScript check |
+| `pnpm test` | Node auth lifecycle and real Axios interceptor tests |
 | `pnpm exec expo install --check` | SDK dependency compatibility |
 | `pnpm dlx expo-doctor` | Project diagnostics without adding a runtime dependency |
 
@@ -51,15 +52,19 @@ src/
     profile/[username].tsx
     track/[id].tsx
   api/
-    client.ts              One Axios instance and interceptors
+    client.ts              Single HTTP/session composition
+    auth.ts                Typed backend auth API and response validation
+    http-client.ts         Session-aware Axios interceptors
     error.ts               Safe typed API errors
   config/env.ts            Validated public environment
+  features/auth/           AuthSession lifecycle, public types and AuthError
   providers/
-    AppProviders.tsx       Global composition, outside navigation groups
+    AppProviders.tsx       QueryProvider > AuthProvider, outside navigation groups
+    AuthProvider.tsx       React subscription, startup and useAuth
     QueryProvider.tsx      Stable QueryClient and native AppState focus subscription
   services/
-    access-token.ts        Memory-only access token
     token-storage.ts       Secure refresh-token persistence
+    token-storage-error.ts Sanitized storage failure type
   theme/
     colors.ts
     spacing.ts
@@ -69,13 +74,13 @@ src/
     index.ts
 ```
 
-Create `components/{ui,layout,music,player}`, `features`, `hooks`, `lib` and `types` only when real implementations require them. Keep non-route code outside `app`. Import source with `@/` and assets with `@/assets/`.
+Create additional presentation, domain and utility directories only when real implementations require them. Keep non-route code outside `app`. Import source with `@/` and assets with `@/assets/`.
 
 ## Navigation and providers
 
 Expo Router owns navigation and typed routes. Existing dynamic paths are preserved. The entry route redirects to `/(tabs)`; no authentication guard is installed. The dark root Stack contains auth, tabs and detail routes. Tabs have native safe-area sizing, text labels and brand active/inactive colors, with no custom icons. Auth is a separate nested Stack.
 
-`AppProviders` persists above the navigators. QueryClient is created once per provider, with 60-second freshness, five-minute unused cache retention, at most two retries for transport/server failures and no automatic mutation or client-error retries. AppState updates focus on native; browser focus remains managed by TanStack. Native network reachability is not wired yet: add Expo Network/onlineManager when offline behavior is implemented. Pass Query's AbortSignal into Axios requests when adding queries.
+`AppProviders` persists above the navigators. QueryClient is created once per provider, with 60-second freshness, five-minute unused cache retention, at most two retries for transport/server failures and no automatic mutation, client-error or AuthError retries. AppState updates focus on native; browser focus remains managed by TanStack. Native network reachability is not wired yet: add Expo Network/onlineManager when offline behavior is implemented. Pass Query's AbortSignal into Axios requests when adding queries.
 
 ## Theme and typography
 
@@ -83,20 +88,40 @@ The web `client/src/styles/theme.css` supplies the brand palette, four-point spa
 
 The web uses `next/font/google` Geist and Geist Mono. No reusable local TTF/OTF files were found, so native typography uses centralized system fonts immediately, without a fake loading step. To adopt Geist, add licensed static TTF/OTF weights (400/500/600/700) to `assets/fonts`, load them with the existing `expo-font` dependency, update role families and navigation fonts, and gate splash dismissal on either font readiness or a handled loading error. Do not use Next font loaders or browser WOFF files in native code.
 
-## Authentication infrastructure and backend contract
+## Authentication architecture and token lifecycle
 
-`api` has a 20-second timeout, an Accept header, a request interceptor that adds the memory token only for the configured backend origin, and a response interceptor that converts Nest errors into `ApiError` (`status`, `code`, `messages`). Axios cancellation stays recognizable. Errors do not retain request configurations or tokens. Callers should use relative backend paths and handle rejected requests.
+`AppProviders` composes QueryProvider > AuthProvider above navigation. `useAuth()` exposes a discriminated `status` (`initializing`, `authenticated`, `unauthenticated`), `user`, `error`, and async `login(input)`, `register(input)`, `logout()`, `refreshUser()` and `restoreSession()` actions. Operational failures reject with `AuthError`; callers must handle rejections. An expired saved session resolves restoration into unauthenticated state with a session-expired error. Startup errors are caught by the provider and remain available through `error`. There are no auth redirects or login requirements.
 
-Verified against `server/src/auth`:
+One `AuthSession` owns state and credentials. React subscribes with `useSyncExternalStore`, without a second copy of session state. The HTTP client and its interceptors are created once outside React. Startup is idempotent under Strict Mode. Provider cleanup detaches the QueryClient callback without logging out or canceling token rotation.
 
-- `POST /auth/login` accepts email/password; `POST /auth/register` accepts username, displayName, email and password.
-- Login, registration and refresh return `access_token`, `refresh_token`, `session_id` and a user with id, username, displayName, email and role.
-- `POST /auth/refresh` and `POST /auth/logout` accept `{ refresh_token: string }` in the JSON body; `GET /auth/me` requires a Bearer access token.
-- Refresh tokens expire after 30 days. Each successful refresh revokes the old session and creates a replacement; simultaneous requests with the old token cannot both succeed.
+Verified against `server/src/auth`, its DTOs, Prisma enums and `UsersService.findPublicByEmail`:
 
-`accessTokenStore` holds access tokens only in memory. `tokenStorage` reads, writes and deletes refresh tokens using SecureStore with a dedicated service and iOS device-only accessibility after first unlock. Absence returns null; native failures or unsupported platforms reject with a sanitized `TokenStorageError`, never silently pretending a write/delete succeeded. There is no browser localStorage fallback. Web authentication remains unimplemented.
+| Endpoint | Request | Response |
+| --- | --- | --- |
+| `POST /auth/login` | email, password (minimum 8 characters) | AuthResponse |
+| `POST /auth/register` | username (minimum 3), displayName (minimum 1), email, password (minimum 8) | AuthResponse |
+| `POST /auth/refresh` | `{ refresh_token: string }` | AuthResponse with rotated token/session |
+| `GET /auth/me` | Bearer access token | CurrentUser |
+| `POST /auth/logout` | `{ refresh_token: string }` | `{ message: string }` |
 
-AuthProvider, session restoration and refresh execution are intentionally deferred. The next implementation must use one refresh operation shared by concurrent requests, exclude refresh calls from retry interception, retry each original request at most once, persist the rotated refresh token before exposing the new session, handle storage failures explicitly, clear memory/cache and invalidate credentials on terminal auth failure, and prevent stale requests from restoring a logged-out session. SecureStore can survive iOS reinstalls: do not infer session validity from stored-token presence.
+AuthResponse contains `access_token`, `refresh_token`, `session_id` and user `{ id, username, displayName, email, role }`. Roles are USER/ADMIN. CurrentUser additionally includes nullable avatar/bio/country, ACTIVE/BANNED/DELETED status, and serialized createdAt/updatedAt dates. Response validation rejects incomplete payloads. `refreshUser()` loads this canonical profile and invalidates inactive users. Access tokens last 15 minutes; refresh sessions last 30 days. Refresh revokes the old session and creates a new one atomically. There is no `/api` prefix or cookie-based mobile refresh contract.
+
+Session restoration reads SecureStore and exchanges an existing refresh token. Access tokens remain in memory only. A replacement refresh token must be persisted before the session becomes authenticated or waiting requests replay. `tokenStorage` retains its dedicated service and device-only iOS accessibility after first unlock. Native storage failures reject with sanitized TokenStorageError, converted to `AuthError` by the session layer. No credentials are logged or included in normalized error request configurations.
+
+Only same-origin requests using the session's Bearer token participate in automatic 401 handling. Login, register, refresh and logout never attach session tokens or trigger refresh. Explicit `authMode: "none"`, manually supplied Authorization headers and external origins opt out. Concurrent 401s share one refresh promise; late 401s reuse an already rotated access token. Each request replays at most once. A second 401 invalidates the session unless its token was superseded by another successful rotation. Cancellation does not cancel a shared refresh, and canceled requests do not replay.
+
+Epochs distinguish accounts/sessions. Logout and account switching immediately clear in-memory credentials, user state and the entire TanStack cache (including public entries, conservatively). QueryClient.clear cancels/removes queries. Old authenticated responses and 401s are rejected after a session change, preventing stale data from repopulating the cache or refreshing a different account. SecureStore operations run in order, so an older in-flight write cannot be the final write after logout/new login. Late credential responses are discarded and their refresh tokens are revoked best-effort.
+
+Failure recovery:
+
+- `invalid-credentials`: rejected login; `request`: validation/conflict response; `session-expired`: terminal 401/403; `network`: transport/timeout; `server`: backend failure; `storage`: SecureStore failure; `invalid-response`: malformed auth payload; `superseded`: a newer session operation won.
+- Temporary refresh network/5xx failures preserve persistent credentials. Startup becomes unauthenticated with an error and can retry with `restoreSession()`. An already authenticated session remains available with the failure exposed.
+- If persisting a rotated token fails, the replacement is retained only in memory and access/user/cache are cleared. `restoreSession()` retries persistence without exchanging the revoked old token. Do not terminate the process before retrying if recovering that replacement matters.
+- Logout clears memory/cache immediately and attempts local deletion before waiting for remote revocation. Failure rejects even though local sign-out has occurred. Failed deletion blocks restoration in this runtime; retry `logout()` to complete cleanup. A new login begins by clearing the previous session and must complete storage cleanup before calling the server.
+
+`pnpm test` uses Node's test runner, the installed TypeScript compiler, real Axios interceptors/adapters and a real QueryClient. Native storage and backend responses are controlled fixtures; tests cover lifecycle, rotation, invalidation, failure recovery, cancellation and concurrent account/logout races. No test framework dependency is added.
+
+Limitations: native SecureStore behavior still needs device testing. Web has no persistent credential fallback and reports unsupported storage; guest routes remain usable. A process death after server rotation but before persistence can lose the replacement; likewise a lost successful refresh response cannot be recovered without backend idempotency/grace support. Both local deletion and remote revocation can fail during logout; this is surfaced and cannot guarantee durable sign-out across a process restart until cleanup succeeds. Offline remote revocation and stale-token cleanup are best-effort; server sessions otherwise expire by TTL. SecureStore may survive iOS reinstalls. Backend logout revokes refresh sessions, not already issued 15-minute access JWTs; the backend login/JWT strategy also does not consistently reject inactive users, so client checks are not a substitute for backend authorization enforcement.
 
 ## Audio plan
 
@@ -112,6 +137,6 @@ The existing QuantumSound logo sources in `assets/images/Logo*` match the web br
 
 `com.quantumsound.mobile` follows the desktop convention `com.quantumsound.desktop`; confirm ownership/store availability before release. Confirm Expo account/owner, EAS project ID, development/production profiles and signing credentials before creating cloud builds. Verify icons/splash/masking and background audio in native builds. No native builds have been executed by this setup.
 
-Next phase: implement AuthProvider with tested refresh rotation and session lifecycle, followed by accessible themed UI and the three primary tabs, then persistent audio playback. Add focused integration tests for authentication concurrency and token storage failure handling as those flows are implemented.
+Next phase: implement accessible themed authentication UI using useAuth, then the three primary tabs, followed by persistent audio playback. Keep navigation access policy explicit when those screens are introduced.
 
 Documentation references: [Expo SDK 57](https://docs.expo.dev/versions/v57.0.0/), [Expo Audio](https://docs.expo.dev/versions/v57.0.0/sdk/audio/), [environment variables](https://docs.expo.dev/guides/environment-variables/), [TanStack React Native](https://tanstack.com/query/latest/docs/framework/react/react-native).
